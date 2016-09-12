@@ -21,42 +21,275 @@
 #include "audioplayer.h"
 #include "file.h"
 #include "theme.h"
+#include "language.h"
 #include "utils.h"
 
-#include "audio/id3.h"
-#include "audio/mp3player.h"
+#include "audio/player.h"
+
+struct fileInfo *fileinfo = NULL;
+vita2d_texture *tex = NULL;
+
+void getAudioInfo(char *file) {
+	char *buffer = NULL;
+
+	fileinfo = getInfoFunct();
+
+	if (tex) {
+		vita2d_free_texture(tex);
+		tex = NULL;
+	}
+
+	switch (fileinfo->encapsulatedPictureType) {
+		case JPEG_IMAGE:
+		case PNG_IMAGE:
+		{
+			SceUID fd = sceIoOpen(file, SCE_O_RDONLY, 0);
+			if (fd >= 0) {
+				char *buffer = malloc(fileinfo->encapsulatedPictureLength);
+				if (buffer) {
+					sceIoLseek32(fd, fileinfo->encapsulatedPictureOffset, SCE_SEEK_SET);
+					sceIoRead(fd, buffer, fileinfo->encapsulatedPictureLength);
+					sceIoClose(fd);
+
+					if (fileinfo->encapsulatedPictureType == JPEG_IMAGE)
+						tex = vita2d_load_JPEG_buffer(buffer, fileinfo->encapsulatedPictureLength);
+
+					if (fileinfo->encapsulatedPictureType == PNG_IMAGE)
+						tex = vita2d_load_PNG_buffer(buffer);
+
+					if (tex)
+						vita2d_texture_set_filters(tex, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
+
+					free(buffer);
+				}
+
+				break;
+			}
+		}
+	}
+}
 
 int audioPlayer(char *file, int type, FileList *list, FileListEntry *entry, int *base_pos, int *rel_pos) {
-	struct ID3Tag id3tag;
-	ParseID3(file, &id3tag);
+	static int speed_list[] = { -7, -3, -1, 0, 1, 3, 7 };
+	#define N_SPEED (sizeof(speed_list) / sizeof(int))
 
-	MP3_Init(0);
-	MP3_Load(file);
-	MP3_Play();
+	sceAppMgrAcquireBgmPort();
+
+	powerLock();
+
+	setAudioFunctions(type);
+
+	initFunct(0);
+	loadFunct(file);
+	playFunct();
+
+	getAudioInfo(file);
 
 	while (1) {
 		readPad();
-
-		if (MP3_EndOfStream())
-			break;
 
 		// Cancel
 		if (pressed_buttons & SCE_CTRL_CANCEL) {
 			break;
 		}
 
+		// Display off
+		if (pressed_buttons & SCE_CTRL_TRIANGLE) {
+			scePowerRequestDisplayOff();
+		}
+
+		// Toggle play/pause
+		if (pressed_buttons & SCE_CTRL_ENTER) {
+			if (isPlayingFunct() && getPlayingSpeedFunct() == 0) {
+				pauseFunct();
+			} else {
+				setPlayingSpeedFunct(0);
+				playFunct();
+			}
+		}
+
+		if (pressed_buttons & SCE_CTRL_LEFT || pressed_buttons & SCE_CTRL_RIGHT) {
+			int speed = getPlayingSpeedFunct();
+
+			if (pressed_buttons & SCE_CTRL_LEFT) {
+				int i;
+				for (i = 0; i < N_SPEED; i++) {
+					if (speed_list[i] == speed) {
+						if (i > 0)
+							speed = speed_list[i - 1];
+						break;
+					}
+				}
+			}
+
+			if (pressed_buttons & SCE_CTRL_RIGHT) {
+				int i;
+				for (i = 0; i < N_SPEED; i++) {
+					if (speed_list[i] == speed) {
+						if (i < N_SPEED - 1)
+							speed = speed_list[i + 1];
+						break;
+					}
+				}
+			}
+
+			setPlayingSpeedFunct(speed);
+
+			playFunct();
+		}
+
+		// Previous/next song.
+		if (getPercentageFunct() == 100.0f || endOfStreamFunct() || pressed_buttons & SCE_CTRL_LTRIGGER || pressed_buttons & SCE_CTRL_RTRIGGER) {
+			int available = 0;
+
+			int old_base_pos = *base_pos;
+			int old_rel_pos = *rel_pos;
+			FileListEntry *old_entry = entry;
+
+			int previous = pressed_buttons & SCE_CTRL_LTRIGGER;
+
+			if (getPercentageFunct() == 100.0f && !endOfStreamFunct())
+				previous = 1;
+
+			if (endOfStreamFunct())
+				previous = 0;
+
+			while (previous ? entry->previous : entry->next) {
+				entry = previous ? entry->previous : entry->next;
+
+				if (previous) {
+					if (*rel_pos > 0) {
+						(*rel_pos)--;
+					} else {
+						if (*base_pos > 0) {
+							(*base_pos)--;
+						}
+					}
+				} else {
+					if ((*rel_pos + 1) < list->length) {
+						if ((*rel_pos + 1) < MAX_POSITION) {
+							(*rel_pos)++;
+						} else {
+							if ((*base_pos + *rel_pos + 1) < list->length) {
+								(*base_pos)++;
+							}
+						}
+					}
+				}
+
+				if (!entry->is_folder) {
+					char path[MAX_PATH_LENGTH];
+					snprintf(path, MAX_PATH_LENGTH, "%s%s", list->path, entry->name);
+					int type = getFileType(path);
+					if (type == FILE_TYPE_MP3 || type == FILE_TYPE_OGG) {
+						file = path;
+
+						endFunct();
+
+						setAudioFunctions(type);
+
+						initFunct(0);
+						loadFunct(file);
+						playFunct();
+
+						getAudioInfo(file);
+
+						available = 1;
+						break;
+					}
+				}
+			}
+
+			if (!available) {
+				*base_pos = old_base_pos;
+				*rel_pos = old_rel_pos;
+				entry = old_entry;
+				break;
+			}
+		}
+
 		// Start drawing
-		startDrawing(NULL);
+		startDrawing(bg_audio_image);
+
+		// Draw shell info
+		drawShellInfo(file);
+
+		float cover_size = MAX_ENTRIES * FONT_Y_SPACE;
+
+		// Cover
+		if (tex) {
+			vita2d_draw_texture_scale(tex, SHELL_MARGIN_X, START_Y, cover_size / vita2d_texture_get_width(tex), cover_size / vita2d_texture_get_height(tex));
+		} else {
+			vita2d_draw_texture(cover_image, SHELL_MARGIN_X, START_Y);
+		}
+		
+		float x = 2.0f * SHELL_MARGIN_X + cover_size;
+
+		pgf_draw_text(x, START_Y + (0 * FONT_Y_SPACE), AUDIO_INFO_ASSIGN, FONT_SIZE, language_container[TITLE]);
+		pgf_draw_text(x, START_Y + (1 * FONT_Y_SPACE), AUDIO_INFO_ASSIGN, FONT_SIZE, language_container[ALBUM]);
+		pgf_draw_text(x, START_Y + (2 * FONT_Y_SPACE), AUDIO_INFO_ASSIGN, FONT_SIZE, language_container[ARTIST]);
+		pgf_draw_text(x, START_Y + (3 * FONT_Y_SPACE), AUDIO_INFO_ASSIGN, FONT_SIZE, language_container[GENRE]);
+		pgf_draw_text(x, START_Y + (4 * FONT_Y_SPACE), AUDIO_INFO_ASSIGN, FONT_SIZE, language_container[YEAR]);
+
+		pgf_draw_text(x + 120.0f, START_Y + (0 * FONT_Y_SPACE), AUDIO_INFO, FONT_SIZE, fileinfo->title[0] == '\0' ? "-" : fileinfo->title);
+		pgf_draw_text(x + 120.0f, START_Y + (1 * FONT_Y_SPACE), AUDIO_INFO, FONT_SIZE, fileinfo->album[0] == '\0' ? "-" : fileinfo->album);
+		pgf_draw_text(x + 120.0f, START_Y + (2 * FONT_Y_SPACE), AUDIO_INFO, FONT_SIZE, fileinfo->artist[0] == '\0' ? "-" : fileinfo->artist);
+		pgf_draw_text(x + 120.0f, START_Y + (3 * FONT_Y_SPACE), AUDIO_INFO, FONT_SIZE, fileinfo->genre[0] == '\0' ? "-" : fileinfo->genre);
+		pgf_draw_text(x + 120.0f, START_Y + (4 * FONT_Y_SPACE), AUDIO_INFO, FONT_SIZE, fileinfo->year[0] == '\0' ? "-" : fileinfo->year);
+
+		float y = SCREEN_HEIGHT - 6.0f * SHELL_MARGIN_Y;
+
+		// Icon
+		vita2d_texture *icon = NULL;
+
+		if (getPlayingSpeedFunct() != 0) {
+			if (getPlayingSpeedFunct() < 0) {
+				icon = fastrewind_image;
+			} else {
+				icon = fastforward_image;
+			}
+
+			pgf_draw_textf(x + 45.0f, y, AUDIO_SPEED, FONT_SIZE, "%dx", abs(getPlayingSpeedFunct() + (getPlayingSpeedFunct() < 0 ? -1 : 1)));
+		} else {
+			if (isPlayingFunct()) {
+				icon = play_image;
+			} else {
+				icon = pause_image;
+			}
+		}
+
+		vita2d_draw_texture(icon, x, y + 3.0f);
+
+		// Time
+		char cur_time_string[12];
+		getTimeStringFunct(cur_time_string);
 
 		char string[32];
-		MP3_GetTimeString(string);
-		pgf_draw_textf(SHELL_MARGIN_X, SCREEN_HEIGHT - 3.0f * SHELL_MARGIN_Y, PHOTO_ZOOM_COLOR, FONT_SIZE, string);
+		sprintf(string, "%s / %s", cur_time_string, fileinfo->strLength);
+		float time_x = ALIGN_LEFT(SCREEN_WIDTH - SHELL_MARGIN_X, vita2d_pgf_text_width(font, FONT_SIZE, string));
+
+		int w = pgf_draw_text(time_x, y, AUDIO_TIME_CURRENT, FONT_SIZE, cur_time_string);
+		pgf_draw_text(time_x + (float)w, y, AUDIO_TIME_SLASH, FONT_SIZE, " /");
+		pgf_draw_text(ALIGN_LEFT(SCREEN_WIDTH - SHELL_MARGIN_X, vita2d_pgf_text_width(font, FONT_SIZE, fileinfo->strLength)), y, AUDIO_TIME_TOTAL, FONT_SIZE, fileinfo->strLength);
+
+		float width = SCREEN_WIDTH - 3.0f * SHELL_MARGIN_X - cover_size;
+		vita2d_draw_rectangle(x, (y) + FONT_Y_SPACE + 10.0f, width, 8, AUDIO_TIME_BAR_BG);
+		vita2d_draw_rectangle(x, (y) + FONT_Y_SPACE + 10.0f, getPercentageFunct() * width / 100.0f, 8, AUDIO_TIME_BAR);
 
 		// End drawing
 		endDrawing();
 	}
 
-	MP3_Stop();
+	if (tex) {
+		vita2d_free_texture(tex);
+		tex = NULL;
+	}
+
+	endFunct();
+
+	powerUnlock();
+
+	sceAppMgrReleaseBgmPort();
 
 	return 0;
 }
